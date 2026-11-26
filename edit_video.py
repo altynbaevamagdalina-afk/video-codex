@@ -7,10 +7,9 @@ import re
 import subprocess
 import tempfile
 
-SPEED = 1.2
 PAUSE = 0.15
 GUARD = 0.045
-FILLERS = re.compile(r"^(?:u+h+|u+m+|e+r+m*|h+m+|m{2,}|[эе]{2,}|м{2,}|эм+)$")
+FILLERS = re.compile(r"^(?:u+h+|u+m+|e+r+m*|h+m+|m{2,}|[эе]{2,}|а{2,}|м{2,}|б[эе]{2,}|эм+|ну(?=\\b))$")
 
 
 def run(*args):
@@ -60,8 +59,9 @@ def speech_cuts(words):
     return cuts
 
 
-def detect(model, audio, language, speed):
-    words = recognize(model, audio, language)
+def detect(model, audio, language, speed, words=None):
+    if words is None:
+        words = recognize(model, audio, language)
     if not words:
         raise ValueError("Speech recognition produced no words")
     log = run("ffmpeg", "-hide_banner", "-i", str(audio), "-af",
@@ -117,19 +117,23 @@ def compose(source, edits, speed):
     return result
 
 
-def graph(ranges, video):
+def graph(ranges, video, speed):
     parts, labels = [], []
     for i, (a, b) in enumerate(ranges):
         if video:
             parts.append(f"[0:v]trim=start={a:.6f}:end={b:.6f},setpts=PTS-STARTPTS[v{i}]")
             labels.append(f"[v{i}]")
-        parts.append(f"[0:a]atrim=start={a:.6f}:end={b:.6f},asetpts=PTS-STARTPTS[a{i}]")
+        fade = min(0.005, (b-a)/4)
+        smooth = "" if i == 0 else f",afade=t=in:d={fade:.6f}"
+        if i + 1 < len(ranges):
+            smooth += f",afade=t=out:st={b-a-fade:.6f}:d={fade:.6f}"
+        parts.append(f"[0:a]atrim=start={a:.6f}:end={b:.6f},asetpts=PTS-STARTPTS{smooth}[a{i}]")
         labels.append(f"[a{i}]")
     parts.append("".join(labels) + f"concat=n={len(ranges)}:v={int(video)}:a=1"
                  + ("[picture][audio]" if video else "[audio]"))
     if video:
-        parts.append(f"[picture]setpts=PTS/{SPEED}[v]")
-    parts.append(f"[audio]atempo={SPEED}[a]")
+        parts.append(f"[picture]setpts=PTS/{speed}[v]")
+    parts.append(f"[audio]atempo={speed}[a]")
     return ";".join(parts)
 
 
@@ -138,18 +142,73 @@ def stamp(t):
     return f"{ms//3600000:02}:{ms//60000%60:02}:{ms//1000%60:02},{ms%1000:03}"
 
 
+def client_style(parser, client):
+    if not client:
+        return None
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", client):
+        parser.error("Use a lowercase client name")
+    path = Path(__file__).with_name("clients") / f"{client}.md"
+    if not path.is_file():
+        parser.error(f"Unknown client: {client}")
+    config = re.search(r"<!-- video-codex: (\{.*\}) -->", path.read_text(encoding="utf-8"))
+    style = json.loads(config[1]).get("subtitles") if config else None
+    if style and (not re.fullmatch(r"[\w -]+", style["font"])
+                  or not 1 <= style["size"] <= 1920 or not 0 < style["y"] < 1
+                  or not 0 <= style["shadow"] <= 0.15):
+        parser.error(f"Invalid subtitle style in {path.name}")
+    return style
+
+
+def choose_speed(words):
+    active = sum(max(0, end-start) for start, end, _, _ in words)
+    rate = len(words) / active if active else 3.0
+    return 1.3 if rate < 2.4 else 1.2 if rate >= 3.1 else 1.25
+
+
+def ass_text(entries, style):
+    def time(t):
+        return stamp(t).replace(",", ".")[:-1]
+
+    alpha = round(255 * (1-style["shadow"]))
+    shadow = 2 if style["shadow"] else 0
+    y = round(1920 * style["y"])
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Caption,{style['font']},{style['size']},&H00FFFFFF,&H00FFFFFF,&HFF000000,&H{alpha:02X}000000,-1,0,0,0,100,100,0,0,1,0,{shadow},5,0,0,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    lines = []
+    for a, b, word in entries:
+        safe = word.translate(str.maketrans({"\\": "＼", "{": "｛", "}": "｝"}))
+        lines.append(f"Dialogue: 0,{time(a)},{time(b)},Caption,,0,0,0,,"
+                     f"{{\\pos(540,{y})\\blur2}}{safe}\n")
+    return header + "".join(lines)
+
+
 def main():
-    from faster_whisper import WhisperModel
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--language", choices=("ru", "en"))
     parser.add_argument("--model", default="small")
+    parser.add_argument("--client", help="Client profile name from clients/")
+    parser.add_argument("--speed", type=float, choices=(1.2, 1.25, 1.3))
     args = parser.parse_args()
+    style = client_style(parser, args.client)
+    styled = args.output.with_suffix(".ass") if style else None
     subtitles = args.output.with_suffix(".srt")
-    if args.output.suffix.lower() != ".mp4" or args.output.exists() or subtitles.exists():
+    if args.output.suffix.lower() != ".mp4" or args.output.exists() or subtitles.exists() or (styled and styled.exists()):
         parser.error("Choose a new .mp4 output path")
+    from faster_whisper import WhisperModel
+
     model = WhisperModel(args.model, device="cpu", compute_type="int8")
     with tempfile.TemporaryDirectory(dir=args.output.resolve().parent) as scratch:
         tmp = Path(scratch)
@@ -157,19 +216,21 @@ def main():
         run("ffmpeg", "-v", "error", "-i", str(args.source), "-vn", "-ar", "16000",
             "-ac", "1", str(source_audio))
         length = duration(source_audio)
-        _, cuts = detect(model, source_audio, args.language, SPEED)
+        original_words = recognize(model, source_audio, args.language)
+        speed = args.speed if args.speed else choose_speed(original_words)
+        _, cuts = detect(model, source_audio, args.language, speed, original_words)
         ranges = keep_ranges(cuts, length)
         for _ in range(4):
             run("ffmpeg", "-v", "error", "-y", "-i", str(source_audio),
-                "-filter_complex", graph(ranges, False), "-map", "[a]", str(preview))
+                "-filter_complex", graph(ranges, False, speed), "-map", "[a]", str(preview))
             words, issues = detect(model, preview, args.language, 1)
             if not issues:
                 break
-            ranges = compose(ranges, keep_ranges(issues, duration(preview)), SPEED)
+            ranges = compose(ranges, keep_ranges(issues, duration(preview)), speed)
         else:
             raise RuntimeError("Speech cleanup did not converge. Review the input before export.")
         run("ffmpeg", "-v", "error", "-i", str(args.source),
-            "-filter_complex", graph(ranges, True), "-map", "[v]", "-map", "[a]",
+            "-filter_complex", graph(ranges, True, speed), "-map", "[v]", "-map", "[a]",
             "-c:v", "libx264", "-crf", "18", "-fps_mode", "vfr", "-c:a", "aac",
             "-b:a", "192k", "-movflags", "+faststart", str(encoded))
         audio_end, video_end = duration(encoded, "a:0"), duration(encoded, "v:0")
@@ -181,13 +242,18 @@ def main():
             a, b = max(0, a, end), min(audio_end, video_end, b)
             if b - a < .035:
                 continue
-            entries.append(f"{len(entries)+1}\n{stamp(a)} --> {stamp(b)}\n{word}")
+            entries.append((a, b, word))
             end = b
         if not entries:
             raise RuntimeError("No subtitle cues could be synchronized")
-        text = "\n\n".join(entries) + "\n"
+        text = "\n\n".join(f"{i}\n{stamp(a)} --> {stamp(b)}\n{word}"
+                           for i, (a, b, word) in enumerate(entries, 1)) + "\n"
         (tmp / "checked.srt").write_text(text, encoding="utf-8")
+        if styled:
+            (tmp / "checked.ass").write_text(ass_text(entries, style), encoding="utf-8")
         encoded.rename(args.output)
+        if styled:
+            (tmp / "checked.ass").rename(styled)
         (tmp / "checked.srt").rename(subtitles)
 
 
