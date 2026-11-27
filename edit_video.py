@@ -142,21 +142,24 @@ def stamp(t):
     return f"{ms//3600000:02}:{ms//60000%60:02}:{ms//1000%60:02},{ms%1000:03}"
 
 
-def client_style(parser, client):
+def client_profile(parser, client):
     if not client:
-        return None
+        return {}
     if not re.fullmatch(r"[a-z][a-z0-9-]*", client):
         parser.error("Use a lowercase client name")
     path = Path(__file__).with_name("clients") / f"{client}.md"
     if not path.is_file():
         parser.error(f"Unknown client: {client}")
     config = re.search(r"<!-- video-codex: (\{.*\}) -->", path.read_text(encoding="utf-8"))
-    style = json.loads(config[1]).get("subtitles") if config else None
+    profile = json.loads(config[1]) if config else {}
+    style = profile.get("subtitles")
+    if "speed" in profile and profile["speed"] not in (1.2, 1.25, 1.3):
+        parser.error(f"Invalid speed in {path.name}")
     if style and (not re.fullmatch(r"[\w -]+", style["font"])
                   or not 1 <= style["size"] <= 1920 or not 0 < style["y"] < 1
                   or not 0 <= style["shadow"] <= 0.15):
         parser.error(f"Invalid subtitle style in {path.name}")
-    return style
+    return profile
 
 
 def choose_speed(words):
@@ -202,7 +205,11 @@ def main():
     parser.add_argument("--client", help="Client profile name from clients/")
     parser.add_argument("--speed", type=float, choices=(1.2, 1.25, 1.3))
     args = parser.parse_args()
-    style = client_style(parser, args.client)
+    profile = client_profile(parser, args.client)
+    fixed_speed = profile.get("speed")
+    if fixed_speed and args.speed and args.speed != fixed_speed:
+        parser.error(f"{args.client} requires --speed {fixed_speed}")
+    style = profile.get("subtitles")
     styled = args.output.with_suffix(".ass") if style else None
     subtitles = args.output.with_suffix(".srt")
     if args.output.suffix.lower() != ".mp4" or args.output.exists() or subtitles.exists() or (styled and styled.exists()):
@@ -217,7 +224,7 @@ def main():
             "-ac", "1", str(source_audio))
         length = duration(source_audio)
         original_words = recognize(model, source_audio, args.language)
-        speed = args.speed if args.speed else choose_speed(original_words)
+        speed = fixed_speed or args.speed or choose_speed(original_words)
         _, cuts = detect(model, source_audio, args.language, speed, original_words)
         ranges = keep_ranges(cuts, length)
         for _ in range(4):
