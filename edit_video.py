@@ -157,6 +157,7 @@ def client_profile(parser, client):
         parser.error(f"Invalid speed in {path.name}")
     if style and (not re.fullmatch(r"[\w -]+", style["font"])
                   or not 1 <= style["size"] <= 1920 or not 0 < style["y"] < 1
+                  or not 0 < style.get("x", 0.5) < 1
                   or not 0 <= style["shadow"] <= 0.15):
         parser.error(f"Invalid subtitle style in {path.name}")
     return profile
@@ -174,6 +175,7 @@ def ass_text(entries, style):
 
     alpha = round(255 * (1-style["shadow"]))
     shadow = 2 if style["shadow"] else 0
+    x = round(1080 * style.get("x", 0.5))
     y = round(1920 * style["y"])
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -191,7 +193,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     for a, b, word in entries:
         safe = word.translate(str.maketrans({"\\": "＼", "{": "｛", "}": "｝"}))
         lines.append(f"Dialogue: 0,{time(a)},{time(b)},Caption,,0,0,0,,"
-                     f"{{\\pos(540,{y})\\blur2}}{safe}\n")
+                     f"{{\\pos({x},{y})\\blur2}}{safe}\n")
     return header + "".join(lines)
 
 
